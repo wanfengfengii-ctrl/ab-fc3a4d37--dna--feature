@@ -138,3 +138,129 @@ def test_ambiguous_payload_reports_two_solutions():
     assert body["data"]["unique"] is False
     assert len(body["data"]["solutions"]) == 2
     assert body["data"]["note"]
+
+
+# --------------------------------------------------------------------------
+# contaminant mode
+# --------------------------------------------------------------------------
+
+
+def make_read_c(rid, start, end, obs, costs=None, allow=None, penalty=None):
+    width = end - start
+    row = {
+        "id": rid,
+        "start": start,
+        "end": end,
+        "observations": list(obs),
+        "mismatch_costs": list(costs) if costs is not None else [1] * width,
+        "max_mismatches": width if allow is None else allow,
+    }
+    if penalty is not None:
+        row["contaminant_penalty"] = penalty
+    return row
+
+
+def contaminant_payload():
+    hap = [0, 1, 1, 0, 1, 0, 0, 1]
+    comp = [1 - b for b in hap]
+    spans0 = [(0, 3), (2, 5), (4, 7), (1, 4), (5, 8)]
+    spans1 = [(0, 2), (3, 6), (6, 8), (2, 4), (4, 8)]
+    reads = []
+    for i, (s, e) in enumerate(spans0):
+        reads.append(make_read_c(f"a{i}", s, e, hap[s:e], allow=0, penalty=10))
+    for i, (s, e) in enumerate(spans1):
+        reads.append(make_read_c(f"b{i}", s, e, comp[s:e], allow=0, penalty=10))
+    reads.append(make_read_c("junk", 0, 5, [1, 0, 1, 0, 1], allow=0, penalty=4))
+    return {"n_sites": 8, "reads": reads, "max_contaminant_reads": 1}
+
+
+def test_phase_contaminant_separates_outlier():
+    r = client.post("/api/phase", json=contaminant_payload())
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert data["contaminant_mode"] == {"enabled": True, "max_contaminant_reads": 1}
+    sol = data["solution"]
+    assert sol["groups"]["contaminants"] == ["junk"]
+    assert sol["contaminant_count"] == 1
+    assert sol["total_mismatch_cost"] == 0
+    assert sol["total_contaminant_penalty"] == 4
+    assert sol["objective_mismatch_cost_plus_penalty"] == 4
+    junk = next(x for x in sol["per_read"] if x["id"] == "junk")
+    assert junk["group"] == 2
+    assert junk["mismatch_count"] is None
+    assert junk["contaminant"] is True
+    assert junk["contaminant_penalty"] == 4
+    assert junk["contaminant_reason"]
+    assert sol["contaminants"][0]["mismatches_vs_haplotype"] == 2
+    assert sol["contaminants"][0]["mismatches_vs_complement"] == 3
+    # three-way assignments align with input order
+    assert sol["assignments"][-1] == 2
+    assert len(sol["groups"]["haplotype"]) == 5
+    assert len(sol["groups"]["complement"]) == 5
+
+
+def test_phase_contaminant_capacity_shortage_409():
+    payload = contaminant_payload()
+    payload["reads"].append(
+        make_read_c("junk2", 3, 8, [0, 1, 0, 1, 0], allow=0, penalty=4)
+    )
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 409
+    body = r.json()
+    assert body["error"]["code"] == "INSUFFICIENT_CONTAMINANT_CAPACITY"
+    assert "2" in body["error"]["message"]
+
+
+def test_phase_group_evidence_shortage_409():
+    p1 = [0, 0, 1, 1, 0, 1, 0, 1]
+    p3 = [0, 1, 0, 1, 0, 1, 0, 1]
+    reads = [make_read_c(f"a{i}", 0, 8, p1, allow=0, penalty=5) for i in range(7)]
+    reads += [make_read_c(f"c{i}", 0, 8, p3, allow=0, penalty=5) for i in range(3)]
+    r = client.post("/api/phase", json={"n_sites": 8, "reads": reads, "max_contaminant_reads": 4})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "INSUFFICIENT_GROUP_EVIDENCE"
+
+
+def test_phase_contaminant_invalid_inputs_422():
+    payload = contaminant_payload()
+    # cap without penalties
+    for row in payload["reads"]:
+        del row["contaminant_penalty"]
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_INPUT"
+
+    # penalties without cap
+    payload = contaminant_payload()
+    del payload["max_contaminant_reads"]
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_INPUT"
+
+    # cap out of range
+    payload = contaminant_payload()
+    payload["max_contaminant_reads"] = 5
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_INPUT"
+
+    # non-positive penalty
+    payload = contaminant_payload()
+    payload["reads"][0]["contaminant_penalty"] = 0
+    r = client.post("/api/phase", json=payload)
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "INVALID_INPUT"
+
+
+def test_phase_legacy_response_shape_unchanged():
+    """Without contaminant fields, response exposes no contaminant keys."""
+    r = client.post("/api/phase", json=clean_payload())
+    assert r.status_code == 200
+    data = r.json()["data"]
+    assert "contaminant_mode" not in data
+    sol = data["solution"]
+    assert "contaminants" not in sol
+    assert "total_contaminant_penalty" not in sol
+    for row in sol["per_read"]:
+        assert "contaminant" not in row
+        assert row["group"] in (0, 1)

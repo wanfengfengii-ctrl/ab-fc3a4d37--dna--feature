@@ -3,29 +3,45 @@
 Jointly recovers a pair of complementary binary haplotypes from degraded
 molecular reads.  For every canonical haplotype candidate (first site fixed
 to ``0``, which removes the group-swap symmetry) each read is assigned to
-exactly one of the two groups (haplotype / complement) so that:
+exactly one of the two groups (haplotype / complement) -- or, when
+contaminant handling is enabled, to a third *contaminant* state -- so that:
 
-1. the read's number of mismatching positions does not exceed its allowance,
-2. each group holds at least two reads,
-3. total mismatch cost is minimized, then
-4. the largest per-read mismatch count is minimized, then
-5. the assignment (and, on full ties, the haplotype) is lexicographically
+1. assigned reads' mismatch counts do not exceed their allowances and the
+   objective (assigned mismatch cost + contaminant penalties) is minimized,
+2. each group holds at least two *non-contaminant* reads,
+3. the largest per-assigned-read mismatch count is minimized, then
+4. the assignment (and, on full ties, the haplotype) is lexicographically
    smallest -- giving a stable decision between uniqueness and ambiguity.
+
+Contaminant reads are exempt from the mismatch allowance and never forced
+onto either homologue; instead they pay a per-read positive penalty, and at
+most ``max_contaminant_reads`` (1..4) may be labelled contaminant.  The
+choice is joint: every read simultaneously chooses group 0, group 1 or
+contaminant, so outliers are never solved for first and pruned afterwards.
+
+Legacy mode (neither ``max_contaminant_reads`` nor any
+``contaminant_penalty`` is supplied) keeps the original request, response,
+decision and error behaviour.
 
 Algorithm (n_sites <= 18, reads <= 36):
 
 * all 2**(n_sites-1) canonical candidates are tabulated with vectorized
   numpy (per-read mismatch counts and costs against each side);
-* an O(reads) greedy analysis gives the exact minimum achievable cost per
-  candidate (group bounds >= 2 never require flipping more than two reads to
-  their dearer side, and equal-cost neutral reads fill deficits for free);
-* among candidates attaining the global minimum cost, a vectorized dynamic
-  program whose only state is the group-0 count is run with a rising cap K on
-  the per-read mismatch count.  The first K at which the minimum cost is
-  reachable with 2..n-2 reads in group 0 is optimal; the first two distinct
-  candidates feasible there are the reported tie set;
+* legacy mode: an O(reads) greedy analysis gives the exact minimum cost per
+  candidate (group bounds >= 2 never require flipping more than two reads
+  to their dearer side, equal-cost neutral reads fill deficits for free);
+* contaminant mode: a vectorized DP whose state is the capped count of
+  reads in each group plus the number of contaminants gives the exact
+  minimum objective per candidate;
+* among candidates attaining the global minimum, a vectorized DP (same
+  state) is run with a rising cap K on the per-assigned-read mismatch
+  count -- contaminant edges carry no mismatch constraint.  The first K at
+  which the minimum objective is reachable with 2..n-2 assigned reads per
+  group is optimal; the first two distinct candidates feasible there are
+  the reported tie set;
 * a final exact (Python) DP for those at most two candidates yields the
-  lexicographically smallest assignment and its mismatch evidence.
+  lexicographically smallest three-way labelling and its mismatch /
+  penalty evidence.
 """
 
 from __future__ import annotations
@@ -57,17 +73,25 @@ class Read:
     obs: tuple[int, ...]
     costs: tuple[int, ...]
     max_mismatches: int
+    contaminant_penalty: int | None = None  # None => read cannot be contaminant
+
+
+@dataclass(frozen=True)
+class ContaminantConfig:
+    max_reads: int  # 1..4
 
 
 @dataclass(frozen=True)
 class Solution:
     haplotype: tuple[int, ...]
-    assignments: tuple[int, ...]  # 0/1 per read, aligned to the input order
+    assignments: tuple[int, ...]  # 0/1 (legacy) or 0/1/2 contaminant
     total_cost: int
     max_mismatches: int
     mismatch_counts: tuple[int, ...]
     mismatch_costs: tuple[int, ...]
     mismatch_positions: tuple[tuple[int, ...], ...]  # global site indices
+    contaminant_penalties: tuple[int, ...] = ()  # per read, 0 unless contaminant
+    total_penalty: int = 0
 
 
 def _as_int_list(value, what: str) -> list[int]:
@@ -81,7 +105,7 @@ def _as_int_list(value, what: str) -> list[int]:
     return out
 
 
-def parse_input(payload: object) -> tuple[int, list[Read]]:
+def parse_input(payload: object) -> tuple[int, list[Read], ContaminantConfig | None]:
     if not isinstance(payload, dict):
         raise PhaseError("INVALID_INPUT", "request body must be a JSON object")
 
@@ -91,6 +115,20 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
     if not 8 <= n_sites <= 18:
         raise PhaseError("INVALID_INPUT", "n_sites must be between 8 and 18")
 
+    # Contaminant handling is opt-in.  It is enabled exactly when at least one
+    # of the two contaminant fields is present; once enabled the count limit
+    # must be an integer in 1..4 and every read must carry a positive
+    # contaminant_penalty (its option to be labelled contaminant).
+    has_cap = "max_contaminant_reads" in payload and payload["max_contaminant_reads"] is not None
+    cfg: ContaminantConfig | None = None
+    if has_cap:
+        cap = payload["max_contaminant_reads"]
+        if isinstance(cap, bool) or not isinstance(cap, int) or not 1 <= cap <= 4:
+            raise PhaseError(
+                "INVALID_INPUT", "max_contaminant_reads must be an integer between 1 and 4"
+            )
+        cfg = ContaminantConfig(max_reads=cap)
+
     raw_reads = payload.get("reads")
     if not isinstance(raw_reads, list):
         raise PhaseError("INVALID_INPUT", "reads must be a list")
@@ -99,6 +137,7 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
 
     reads: list[Read] = []
     seen_ids: set[str] = set()
+    penalty_seen = False
     for idx, item in enumerate(raw_reads):
         if not isinstance(item, dict):
             raise PhaseError("INVALID_INPUT", f"reads[{idx}] must be an object")
@@ -142,6 +181,19 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
         if allow > width:
             raise PhaseError("INVALID_INPUT", f"reads[{idx}].max_mismatches exceeds its span")
 
+        # Per-read contaminant penalty; the option to label this read a
+        # contaminant exists only when it carries a positive penalty.
+        penalty: int | None = None
+        if "contaminant_penalty" in item and item["contaminant_penalty"] is not None:
+            penalty_seen = True
+            pv = item["contaminant_penalty"]
+            if isinstance(pv, bool) or not isinstance(pv, int) or pv <= 0:
+                raise PhaseError(
+                    "INVALID_INPUT",
+                    f"reads[{idx}].contaminant_penalty must be a positive integer",
+                )
+            penalty = pv
+
         reads.append(
             Read(
                 id=rid,
@@ -150,18 +202,45 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
                 obs=tuple(obs),
                 costs=tuple(costs),
                 max_mismatches=allow,
+                contaminant_penalty=penalty,
             )
         )
 
+    # Feature gating: it activates iff at least one of the two fields is
+    # present; then both must be supplied completely.
+    if cfg is not None and not penalty_seen:
+        raise PhaseError(
+            "INVALID_INPUT",
+            "every read must carry a positive contaminant_penalty when "
+            "max_contaminant_reads is set",
+        )
+    if penalty_seen and cfg is None:
+        raise PhaseError(
+            "INVALID_INPUT",
+            "max_contaminant_reads (an integer from 1 to 4) is required when "
+            "contaminant_penalty is supplied",
+        )
+    if cfg is not None:
+        missing = [r.id for r in reads if r.contaminant_penalty is None]
+        if missing:
+            raise PhaseError(
+                "INVALID_INPUT",
+                "every read must carry a positive contaminant_penalty; "
+                f"missing for: {', '.join(missing[:5])}",
+            )
+
     # The optimizer tabulates costs in signed 64-bit integers; reject inputs
-    # whose theoretical maximum total cost could interfere with the DP's
+    # whose theoretical maximum total score could interfere with the DP's
     # infinity sentinel (inf ~ 2**61, so path sums must stay far below it).
     grand_total = sum(sum(r.costs) for r in reads)
+    if cfg is not None:
+        grand_total += sum(r.contaminant_penalty for r in reads)
     if grand_total > (1 << 58):
         raise PhaseError(
             "INVALID_INPUT",
-            "sum of mismatch costs is too large to score exactly; costs must be "
-            "small positive integers (aggregate cost must fit in 59 bits)",
+            "sum of mismatch costs and contaminant penalties is too large to "
+            "score exactly; values must be small positive integers "
+            "(aggregate score must fit in 59 bits)",
         )
 
     # Every read is a contiguous interval by construction.  Across reads the
@@ -178,7 +257,7 @@ def parse_input(payload: object) -> tuple[int, list[Read]]:
             f"site {gap} is not covered by any read; reads do not form a continuous tiling",
         )
 
-    return n_sites, reads
+    return n_sites, reads, cfg
 
 
 # ----- candidate tables -----------------------------------------------------
@@ -437,7 +516,247 @@ def solve_assignments(
     return [(mx, bits) for bits, mx in finals[:limit]]
 
 
-# ----- top level ------------------------------------------------------------
+# ----- contaminant mode: joint three-way labelling -------------------------
+
+
+def _contam_dp_chunk(
+    c0v: np.ndarray,
+    c1v: np.ndarray,
+    penalties: np.ndarray,
+    a0: np.ndarray,
+    a1: np.ndarray,
+    cq_limit: int,
+) -> np.ndarray:
+    """Vectorized three-way labelling DP for a chunk of candidates.
+
+    Every read jointly chooses group 0, group 1 or contaminant.  State is
+    ``(reads in group 0 capped at 2, reads in group 1 capped at 2, number of
+    contaminants)``: the cap is exact because the only group constraints are
+    "at least two non-contaminant reads each", while the contaminant count
+    has a hard upper bound.  Group edges carry the mismatch cost and are
+    usable only when the side is feasible *and* within the current mismatch
+    cap (already encoded in ``a0``/``a1``); the contaminant edge carries the
+    fixed penalty and is never mismatch-constrained.
+
+    Returns the final DP table shaped ``(t, 3, 3, cq_limit+1)``.
+    """
+    t = c0v.shape[0]
+    inf = np.int64(np.iinfo(np.int64).max // 4)
+    work = np.full((t, 3, 3, cq_limit + 1), inf, dtype=np.int64)
+    work[:, 0, 0, 0] = 0
+
+    for i in range(c0v.shape[1]):
+        nxt = np.full((t, 3, 3, cq_limit + 1), inf, dtype=np.int64)
+        can0 = a0[:, i]
+        can1 = a1[:, i]
+        if np.any(can0):
+            r = np.where(can0)[0]
+            added = work[r, :-1, :, :] + c0v[r, i, None, None, None]
+            nxt[r, 1:, :, :] = np.minimum(nxt[r, 1:, :, :], added)
+            # saturated group-0 reads self-loop on the capped count
+            loop = work[r, 2:3, :, :] + c0v[r, i, None, None, None]
+            nxt[r, 2:3, :, :] = np.minimum(nxt[r, 2:3, :, :], loop)
+        if np.any(can1):
+            r = np.where(can1)[0]
+            added = work[r, :, :-1, :] + c1v[r, i, None, None, None]
+            nxt[r, :, 1:, :] = np.minimum(nxt[r, :, 1:, :], added)
+            # saturated group-1 reads self-loop on the capped count
+            loop = work[r, :, 2:3, :] + c1v[r, i, None, None, None]
+            nxt[r, :, 2:3, :] = np.minimum(nxt[r, :, 2:3, :], loop)
+        # contaminant mode guarantees a positive penalty for every read
+        added = work[:, :, :, :-1] + np.int64(penalties[i])
+        nxt[:, :, :, 1:] = np.minimum(nxt[:, :, :, 1:], added)
+        work = nxt
+    return work
+
+
+def contaminant_scores(
+    mm0: np.ndarray,
+    mm1: np.ndarray,
+    cost0: np.ndarray,
+    cost1: np.ndarray,
+    feas0: np.ndarray,
+    feas1: np.ndarray,
+    penalties: np.ndarray,
+    cq_limit: int,
+    cap: int,
+    candidate_ids: np.ndarray | None = None,
+    chunk: int = 4096,
+) -> np.ndarray:
+    """Minimum joint objective per candidate (inf where infeasible).
+
+    When ``candidate_ids`` is given, scores are returned only for those rows
+    in the same order; otherwise for every candidate row.  ``cap`` bounds the
+    mismatch count of *assigned* reads only; contaminant edges ignore it.
+    """
+    if candidate_ids is None:
+        candidate_ids = np.arange(mm0.shape[0], dtype=np.int64)
+    scores = np.empty(len(candidate_ids), dtype=np.int64)
+
+    for start in range(0, len(candidate_ids), chunk):
+        ids = candidate_ids[start : start + chunk]
+        a0 = feas0[ids] & (mm0[ids] <= cap)
+        a1 = feas1[ids] & (mm1[ids] <= cap)
+        work = _contam_dp_chunk(cost0[ids], cost1[ids], penalties, a0, a1, cq_limit)
+        # valid end states: both groups saturated (>=2 reads), any q <= limit
+        scores[start : start + len(ids)] = work[:, 2, 2, :].min(axis=1)
+    return scores
+
+
+def contaminant_feasible_under_cap(
+    mm0: np.ndarray,
+    mm1: np.ndarray,
+    cost0: np.ndarray,
+    cost1: np.ndarray,
+    feas0: np.ndarray,
+    feas1: np.ndarray,
+    penalties: np.ndarray,
+    cq_limit: int,
+    candidate_ids: np.ndarray,
+    target_score: int,
+    cap: int,
+) -> list[int]:
+    """Candidates reaching ``target_score`` under mismatch ``cap``."""
+    scores = contaminant_scores(
+        mm0,
+        mm1,
+        cost0,
+        cost1,
+        feas0,
+        feas1,
+        penalties,
+        cq_limit,
+        cap,
+        candidate_ids=candidate_ids,
+    )
+    ok = scores == target_score
+    return [int(candidate_ids[k]) for k in np.where(ok)[0]]
+
+
+def contaminant_failure_reason(
+    feas0: np.ndarray,
+    feas1: np.ndarray,
+    cq_limit: int,
+) -> PhaseError:
+    """Distinguish "cap too small" from "too little valid group evidence".
+
+    Ignoring the contaminant count cap, a candidate admits *some* valid
+    labelling iff two distinct reads can cover group 0 and two distinct
+    reads group 1 (Hall: ``|S0|>=2``, ``|S1|>=2``, ``|S0 u S1|>=4`` with
+    ``Sg`` the reads feasible against group g within allowance).  Then the
+    minimum contaminant count is ``n - |S0 u S1|``.
+    """
+    c0 = feas0.sum(axis=1)
+    c1 = feas1.sum(axis=1)
+    union = (feas0 | feas1).sum(axis=1)
+    n = feas0.shape[1]
+    viable = (c0 >= 2) & (c1 >= 2) & (union >= 4)
+    if not bool(viable.any()):
+        return PhaseError(
+            "INSUFFICIENT_GROUP_EVIDENCE",
+            "no canonical haplotype leaves at least two non-contaminant reads "
+            "within allowance for each of the two groups; the extract does not "
+            "contain enough valid evidence for both homologues",
+        )
+    needed = int((n - union[viable]).min())
+    return PhaseError(
+        "INSUFFICIENT_CONTAMINANT_CAPACITY",
+        f"at least {needed} read{'s' if needed != 1 else ''} must be labelled "
+        f"contaminant but max_contaminant_reads={cq_limit}; raise the limit or "
+        "inspect the extract",
+    )
+
+
+def solve_contaminant_assignments(
+    m0: list[int],
+    m1: list[int],
+    c0: list[int],
+    c1: list[int],
+    f0: list[bool],
+    f1: list[bool],
+    penalties: list[int],
+    cq_limit: int,
+    target_score: int,
+    cap: int,
+    limit: int = 2,
+) -> list[tuple[int, int]]:
+    """Up to ``limit`` lexicographically smallest three-way labellings.
+
+    Returns ``(actual max assigned mismatch, base-3 label digits)`` pairs.
+    Labels use digits 0/1/2 per read (2 = contaminant), most significant read
+    first, so integer order is lexicographic order with contaminants sorting
+    last.  State tracks capped group counts, the exact contaminant count and
+    the per-group running mismatch maximum.
+
+    Distinct labellings can share a state (e.g. two reads swap sides without
+    changing the counts), so each state keeps the two smallest
+    ``(score, digits)`` paths: a 2-best DP, which suffices to recover the two
+    smallest complete explanations (future edges never depend on which reads
+    filled a group, so a costlier prefix of the same state can never catch up
+    to the cheapest one).
+    """
+    n = len(m0)
+    dp: dict[tuple[int, int, int, int, int], list[tuple[int, int]]] = {
+        (0, 0, 0, 0, 0): [(0, 0)]
+    }
+
+    for i in range(n):
+        weight = 3 ** (n - 1 - i)
+        can0 = f0[i] and m0[i] <= cap
+        can1 = f1[i] and m1[i] <= cap
+        nxt: dict[tuple[int, int, int, int, int], list[tuple[int, int]]] = {}
+
+        def extend(key, candidates):
+            bucket = nxt.setdefault(key, [])
+            bucket.extend(candidates)
+
+        for (a0, a1, q, mx0, mx1), paths in dp.items():
+            if can0:
+                key0 = (min(2, a0 + 1), a1, q, max(mx0, m0[i]), mx1)
+                extend(
+                    key0,
+                    [
+                        (tot + c0[i], digits)
+                        for tot, digits in paths
+                        if tot + c0[i] <= target_score
+                    ],
+                )
+            if can1:
+                key1 = (a0, min(2, a1 + 1), q, mx0, max(mx1, m1[i]))
+                extend(
+                    key1,
+                    [
+                        (tot + c1[i], digits + weight)
+                        for tot, digits in paths
+                        if tot + c1[i] <= target_score
+                    ],
+                )
+            if q < cq_limit:  # contaminant edge: penalty, no mismatch bound
+                keyq = (a0, a1, q + 1, mx0, mx1)
+                extend(
+                    keyq,
+                    [
+                        (tot + penalties[i], digits + 2 * weight)
+                        for tot, digits in paths
+                        if tot + penalties[i] <= target_score
+                    ],
+                )
+        # k-best DP: the two smallest (score, digits) per state are enough to
+        # recover the two globally smallest complete explanations.
+        dp = {key: sorted(set(paths))[:2] for key, paths in nxt.items()}
+
+    finals: list[tuple[int, int]] = []  # (digits, max mm)
+    for (a0, a1, _q, mx0, mx1), paths in dp.items():
+        if a0 == 2 and a1 == 2:
+            for tot, digits in paths:
+                if tot == target_score:
+                    finals.append((digits, max(mx0, mx1)))
+    finals.sort()
+    return [(mx, digits) for digits, mx in finals[:limit]]
+
+
+def _labels_to_tuple(digits: int, n: int) -> tuple[int, ...]:
+    return tuple((digits // 3 ** (n - 1 - i)) % 3 for i in range(n))
 
 
 def _hap_from_bits(hap_bits: int, n_sites: int) -> tuple[int, ...]:
@@ -448,7 +767,20 @@ def _bits_to_tuple(bits: int, n: int) -> tuple[int, ...]:
     return tuple((bits >> (n - 1 - i)) & 1 for i in range(n))
 
 
-def enumerate_solutions(n_sites: int, reads: list[Read]) -> list[Solution]:
+def enumerate_solutions(
+    n_sites: int, reads: list[Read], cfg: ContaminantConfig | None = None
+) -> list[Solution]:
+    """Legacy-style accessor: return just the solution list.
+
+    Contaminant callers use :func:`_enumerate_contaminant` directly so they
+    can diagnose infeasibility from the feasibility tables.
+    """
+    if cfg is None:
+        return _enumerate_legacy(n_sites, reads)
+    solutions, *_ = _enumerate_contaminant(n_sites, reads, cfg)
+    return solutions
+
+def _enumerate_legacy(n_sites: int, reads: list[Read]) -> list[Solution]:
     n = len(reads)
     mm0, mm1, cost0, cost1, feas0, feas1 = candidate_tables(n_sites, reads)
     c_count = 1 << (n_sites - 1)
@@ -523,68 +855,234 @@ def enumerate_solutions(n_sites: int, reads: list[Read]) -> list[Solution]:
     for hb, maxmm, assign_bits in picked:
         hap = _hap_from_bits(hb, n_sites)
         assignments = _bits_to_tuple(assign_bits, n)
-        mm_counts: list[int] = []
-        mm_costs: list[int] = []
-        mm_pos: list[tuple[int, ...]] = []
-        for r, g in zip(reads, assignments):
-            count = 0
-            spent = 0
-            positions: list[int] = []
-            for k, site in enumerate(range(r.start, r.end)):
-                mismatch = (r.obs[k] != hap[site]) if g == 0 else (r.obs[k] == hap[site])
-                if mismatch:
-                    count += 1
-                    spent += r.costs[k]
-                    positions.append(site)
-            mm_counts.append(count)
-            mm_costs.append(spent)
-            mm_pos.append(tuple(positions))
+        mm_counts, mm_costs, mm_pos = _assignment_evidence(reads, hap, assignments)
         solutions.append(
             Solution(
                 haplotype=hap,
                 assignments=assignments,
                 total_cost=global_best,
                 max_mismatches=maxmm,
-                mismatch_counts=tuple(mm_counts),
-                mismatch_costs=tuple(mm_costs),
-                mismatch_positions=tuple(mm_pos),
+                mismatch_counts=mm_counts,
+                mismatch_costs=mm_costs,
+                mismatch_positions=mm_pos,
             )
         )
     return solutions
 
 
+def _enumerate_contaminant(
+    n_sites: int, reads: list[Read], cfg: ContaminantConfig
+) -> tuple[list[Solution], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return ``(solutions, mm0, mm1, feas0, feas1)``.
+
+    On infeasibility the solution list is empty and the caller diagnoses the
+    business reason from the feasibility tables.
+    """
+    n = len(reads)
+    mm0, mm1, cost0, cost1, feas0, feas1 = candidate_tables(n_sites, reads)
+    penalties = np.asarray([r.contaminant_penalty for r in reads], dtype=np.int64)
+    cq_limit = cfg.max_reads
+    max_span = max(r.end - r.start for r in reads)
+
+    # Pass 1: the joint objective (non-contaminant mismatch cost + penalties)
+    # with the mismatch cap fully relaxed.  Assigned reads must still respect
+    # their allowances (feas0/feas1); contaminant edges never do.
+    scores = contaminant_scores(
+        mm0, mm1, cost0, cost1, feas0, feas1, penalties, cq_limit, cap=max_span
+    )
+    inf = np.iinfo(np.int64).max // 4
+    finite = scores < inf
+    if not bool(finite.any()):
+        return [], mm0, mm1, feas0, feas1
+    global_best = int(scores[finite].min())
+    tied = np.asarray(sorted(int(h) for h in np.where(scores == global_best)[0]), dtype=np.int64)
+
+    # Pass 2: rising cap on the per-assigned-read mismatch count.  Contaminant
+    # edges stay unconditional, so an outlier never blocks the cap optimum.
+    chosen: list[int] = []
+    chosen_cap = 0
+    for cap in range(0, max_span + 1):
+        found = contaminant_feasible_under_cap(
+            mm0, mm1, cost0, cost1, feas0, feas1, penalties, cq_limit, tied, global_best, cap
+        )
+        if found:
+            chosen = sorted(found)[:2]
+            chosen_cap = cap
+            break
+    if not chosen:  # pragma: no cover - pass 1 already guarantees a winner
+        return [], mm0, mm1, feas0, feas1
+
+    picked: list[tuple[int, int, int]] = []  # (hap bits, max mm, label digits)
+    for hb in chosen:
+        if len(picked) >= 2:
+            break
+        exact_list = solve_contaminant_assignments(
+            mm0[hb].tolist(),
+            mm1[hb].tolist(),
+            cost0[hb].tolist(),
+            cost1[hb].tolist(),
+            feas0[hb].tolist(),
+            feas1[hb].tolist(),
+            [r.contaminant_penalty for r in reads],
+            cq_limit,
+            global_best,
+            chosen_cap,
+            limit=2 - len(picked),
+        )
+        for maxmm, digits in exact_list:
+            picked.append((hb, maxmm, digits))
+
+    solutions: list[Solution] = []
+    for hb, maxmm, digits in picked:
+        hap = _hap_from_bits(hb, n_sites)
+        labels = _labels_to_tuple(digits, n)
+        mm_counts, mm_costs, mm_pos = _assignment_evidence(reads, hap, labels)
+        pen_paid = tuple(
+            (reads[i].contaminant_penalty if g == 2 else 0) for i, g in enumerate(labels)
+        )
+        solutions.append(
+            Solution(
+                haplotype=hap,
+                assignments=labels,
+                total_cost=sum(c for g, c in zip(labels, mm_costs) if g != 2),
+                max_mismatches=maxmm,
+                mismatch_counts=mm_counts,
+                mismatch_costs=mm_costs,
+                mismatch_positions=mm_pos,
+                contaminant_penalties=pen_paid,
+                total_penalty=sum(pen_paid),
+            )
+        )
+    return solutions, mm0, mm1, feas0, feas1
+
+
+def _assignment_evidence(
+    reads: list[Read], hap: tuple[int, ...], assignments: tuple[int, ...]
+) -> tuple[tuple[int, ...], tuple[int, ...], tuple[tuple[int, ...], ...]]:
+    """Per-read mismatch count/cost/positions.
+
+    Contaminant-labelled reads (2) contribute zeros and no positions: they
+    are not scored against either homologue.
+    """
+    mm_counts: list[int] = []
+    mm_costs: list[int] = []
+    mm_pos: list[tuple[int, ...]] = []
+    for r, g in zip(reads, assignments):
+        count = 0
+        spent = 0
+        positions: list[int] = []
+        if g != 2:
+            for k, site in enumerate(range(r.start, r.end)):
+                mismatch = (r.obs[k] != hap[site]) if g == 0 else (r.obs[k] == hap[site])
+                if mismatch:
+                    count += 1
+                    spent += r.costs[k]
+                    positions.append(site)
+        mm_counts.append(count)
+        mm_costs.append(spent)
+        mm_pos.append(tuple(positions))
+    return tuple(mm_counts), tuple(mm_costs), tuple(mm_pos)
+
+
 def phase(payload: object) -> dict:
     """Validate, solve and build the API response payload."""
-    n_sites, reads = parse_input(payload)
-    solutions = enumerate_solutions(n_sites, reads)
+    n_sites, reads, cfg = parse_input(payload)
+
+    if cfg is None:
+        solutions = enumerate_solutions(n_sites, reads)
+        if not solutions:
+            raise PhaseError(
+                "NO_SOLUTION",
+                "no complementary haplotype pair admits an assignment with at "
+                "least two reads in each group within the mismatch allowances",
+            )
+        return _build_response(n_sites, reads, solutions, cfg=None)
+
+    solutions, _mm0, _mm1, feas0, feas1 = _enumerate_contaminant(n_sites, reads, cfg)
     if not solutions:
-        raise PhaseError(
-            "NO_SOLUTION",
-            "no complementary haplotype pair admits an assignment with at "
-            "least two reads in each group within the mismatch allowances",
+        raise contaminant_failure_reason(feas0, feas1, cfg.max_reads)
+    return _build_response(n_sites, reads, solutions, cfg=cfg)
+
+
+def _contaminant_reason(read: Read, mm_vs_hap: int, mm_vs_comp: int) -> str:
+    """Human-readable evidence for why a read was labelled contaminant."""
+    allow = read.max_mismatches
+    over_hap = mm_vs_hap > allow
+    over_comp = mm_vs_comp > allow
+    if over_hap and over_comp:
+        return (
+            f"{mm_vs_hap} mismatch(es) vs the haplotype and {mm_vs_comp} vs the "
+            f"complement both exceed the allowance of {allow}; the read fits "
+            "neither homologue"
         )
+    if over_hap:
+        return (
+            f"{mm_vs_hap} mismatch(es) vs the haplotype exceed the allowance of "
+            f"{allow} (only {mm_vs_comp} vs the complement); joint optimization "
+            f"pays penalty {read.contaminant_penalty} instead of distorting a group"
+        )
+    if over_comp:
+        return (
+            f"{mm_vs_comp} mismatch(es) vs the complement exceed the allowance of "
+            f"{allow} (only {mm_vs_hap} vs the haplotype); joint optimization "
+            f"pays penalty {read.contaminant_penalty} instead of distorting a group"
+        )
+    return (
+        f"within the allowance of {allow} against both homologues "
+        f"({mm_vs_hap}/{mm_vs_comp} mismatches), but the joint optimum pays the "
+        f"penalty of {read.contaminant_penalty} rather than force it into a group"
+    )
+
+
+def _build_response(
+    n_sites: int,
+    reads: list[Read],
+    solutions: list[Solution],
+    cfg: ContaminantConfig | None,
+) -> dict:
+    contaminant_mode = cfg is not None
 
     def serialize(sol: Solution) -> dict:
         groups: list[list[str]] = [[], []]
+        contaminant_ids: list[str] = []
+        contaminant_details: list[dict] = []
         per_read = []
-        for r, g, mc, mco, pos in zip(
-            reads,
-            sol.assignments,
-            sol.mismatch_counts,
-            sol.mismatch_costs,
-            sol.mismatch_positions,
+        for i, (r, g, mc, mco, pos) in enumerate(
+            zip(
+                reads,
+                sol.assignments,
+                sol.mismatch_counts,
+                sol.mismatch_costs,
+                sol.mismatch_positions,
+            )
         ):
-            groups[g].append(r.id)
-            per_read.append(
-                {
+            if g == 2:
+                contaminant_ids.append(r.id)
+                row = {
+                    "id": r.id,
+                    "group": 2,
+                    "mismatch_count": None,
+                    "mismatch_cost": None,
+                    "mismatch_positions": [],
+                    "contaminant": True,
+                    "contaminant_penalty": sol.contaminant_penalties[i],
+                }
+                per_read.append(row)
+            else:
+                groups[g].append(r.id)
+                row = {
                     "id": r.id,
                     "group": g,
                     "mismatch_count": mc,
                     "mismatch_cost": mco,
                     "mismatch_positions": list(pos),
                 }
-            )
-        return {
+                if contaminant_mode:
+                    row["contaminant"] = False
+                    row["contaminant_penalty"] = 0
+                per_read.append(row)
+
+        out = {
             "haplotype": list(sol.haplotype),
             "complement": [1 - b for b in sol.haplotype],
             "groups": {"haplotype": groups[0], "complement": groups[1]},
@@ -594,17 +1092,71 @@ def phase(payload: object) -> dict:
             "max_per_read_mismatches": sol.max_mismatches,
             "mismatch_positions": sorted({p for tup in sol.mismatch_positions for p in tup}),
         }
+        if contaminant_mode:
+            # Contaminant evidence: recompute each outlier's mismatch profile
+            # against this solution's canonical haplotype and its complement.
+            for i, g in enumerate(sol.assignments):
+                if g != 2:
+                    continue
+                r = reads[i]
+                mm_vs_hap = _mm_for_read(sol.haplotype, r, side=0)
+                mm_vs_comp = (r.end - r.start) - mm_vs_hap
+                reason = _contaminant_reason(r, mm_vs_hap, mm_vs_comp)
+                per_read[i]["contaminant_reason"] = reason
+                contaminant_details.append(
+                    {
+                        "id": r.id,
+                        "penalty": sol.contaminant_penalties[i],
+                        "mismatches_vs_haplotype": mm_vs_hap,
+                        "mismatches_vs_complement": mm_vs_comp,
+                        "max_mismatches_allowance": r.max_mismatches,
+                        "reason": reason,
+                    }
+                )
+            out["groups"]["contaminants"] = contaminant_ids
+            out["contaminants"] = contaminant_details
+            out["contaminant_count"] = len(contaminant_ids)
+            out["total_contaminant_penalty"] = sol.total_penalty
+            out["objective_mismatch_cost_plus_penalty"] = sol.total_cost + sol.total_penalty
+        return out
+
+    serialized = [serialize(sol) for sol in solutions]
 
     response: dict = {
         "n_sites": n_sites,
         "unique": len(solutions) == 1,
-        "solutions": [serialize(s) for s in solutions],
+        "solutions": serialized,
     }
     response["solution"] = response["solutions"][0]
+    if contaminant_mode:
+        response["contaminant_mode"] = {
+            "enabled": True,
+            "max_contaminant_reads": cfg.max_reads,
+        }
     if len(solutions) > 1:
+        first = (
+            "total mismatch cost plus contaminant penalty"
+            if contaminant_mode
+            else "total_mismatch_cost"
+        )
         response["note"] = (
-            "two distinct solutions tie on (total_mismatch_cost, "
-            "max_per_read_mismatches); they may differ in haplotype or in the "
-            "per-read assignment. The first two canonical solutions are returned"
+            "two distinct solutions tie on ("
+            + first
+            + ", max_per_read_mismatches); they may differ in haplotype, in the "
+            "per-read assignment"
+            + (" or in the contaminant labelling" if contaminant_mode else "")
+            + ". The first two canonical solutions are returned"
         )
     return response
+
+
+def _mm_for_read(hap: tuple[int, ...], r: Read, side: int) -> int:
+    """Mismatch count of one read against the haplotype (side 0) or complement."""
+    count = 0
+    for k, site in enumerate(range(r.start, r.end)):
+        mismatch = (r.obs[k] != hap[site]) if side == 0 else (r.obs[k] == hap[site])
+        if mismatch:
+            count += 1
+    return count
+
+

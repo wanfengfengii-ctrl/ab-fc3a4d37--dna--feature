@@ -9,8 +9,10 @@ Runs inside the image (or a local checkout) and performs, in order:
      * a unique solution with degraded (mismatch-carrying) reads and exact
        mismatch evidence,
      * an ambiguous instance returning the first two distinct solutions,
+     * a contaminant instance that isolates an environmental outlier via a
+       joint three-way labelling, plus both contaminant business errors,
      * NO_SOLUTION and DISCONTINUOUS_INPUT business errors,
-     * INVALID_INPUT shape validation.
+     * INVALID_INPUT shape validation (legacy and contaminant modes).
 
 The exit code is a bit-mask summarizing the stages:
 
@@ -43,9 +45,9 @@ FAIL_SMOKE = 2
 # --------------------------------------------------------------------------
 
 
-def make_read(rid, start, end, obs, costs=None, allow=None):
+def make_read(rid, start, end, obs, costs=None, allow=None, penalty=None):
     width = end - start
-    return {
+    row = {
         "id": rid,
         "start": start,
         "end": end,
@@ -53,6 +55,9 @@ def make_read(rid, start, end, obs, costs=None, allow=None):
         "mismatch_costs": list(costs) if costs is not None else [1] * width,
         "max_mismatches": width if allow is None else allow,
     }
+    if penalty is not None:
+        row["contaminant_penalty"] = penalty
+    return row
 
 
 def mismatch_sample():
@@ -113,6 +118,39 @@ def discontinuous_sample():
         "n_sites": 8,
         "reads": [make_read(f"d{j}", s, e, [0] * (e - s), allow=e - s) for j, (s, e) in enumerate(spans)],
     }
+
+
+def contaminant_sample():
+    """Ten clean reads plus one foreign read isolated as a contaminant."""
+    hap = [0, 1, 1, 0, 1, 0, 0, 1]
+    comp = [1 - b for b in hap]
+    spans0 = [(0, 3), (2, 5), (4, 7), (1, 4), (5, 8)]
+    spans1 = [(0, 2), (3, 6), (6, 8), (2, 4), (4, 8)]
+    reads = []
+    for i, (s, e) in enumerate(spans0):
+        reads.append(make_read(f"a{i}", s, e, hap[s:e], allow=0, penalty=10))
+    for i, (s, e) in enumerate(spans1):
+        reads.append(make_read(f"b{i}", s, e, comp[s:e], allow=0, penalty=10))
+    reads.append(make_read("junk", 0, 5, [1, 0, 1, 0, 1], allow=0, penalty=4))
+    return {"n_sites": 8, "reads": reads, "max_contaminant_reads": 1}
+
+
+def contaminant_capacity_short_sample():
+    """Two foreign reads but only one contaminant slot -> business error."""
+    payload = contaminant_sample()
+    payload["reads"].append(
+        make_read("junk2", 3, 8, [0, 1, 0, 1, 0], allow=0, penalty=4)
+    )
+    return payload
+
+
+def contaminant_evidence_short_sample():
+    """Only one side can be supported, regardless of the contaminant cap."""
+    p1 = [0, 0, 1, 1, 0, 1, 0, 1]
+    p3 = [0, 1, 0, 1, 0, 1, 0, 1]
+    reads = [make_read(f"a{i}", 0, 8, p1, allow=0, penalty=5) for i in range(7)]
+    reads += [make_read(f"c{i}", 0, 8, p3, allow=0, penalty=5) for i in range(3)]
+    return {"n_sites": 8, "reads": reads, "max_contaminant_reads": 4}
 
 
 # --------------------------------------------------------------------------
@@ -245,8 +283,66 @@ def smoke() -> list[str]:
         check(status == 422, f"status {status}")
         check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
 
+    def case_contaminant():
+        status, body = request("POST", "/api/phase", contaminant_sample())
+        check(status == 200, f"status {status}, body {body}")
+        data = body["data"]
+        check(data["contaminant_mode"]["enabled"] is True, "contaminant mode flag")
+        check(data["contaminant_mode"]["max_contaminant_reads"] == 1, "echoed cap")
+        sol = data["solution"]
+        check(sol["groups"]["contaminants"] == ["junk"], "outlier must be contaminant")
+        check(sol["contaminant_count"] == 1, "one contaminant")
+        check(sol["total_mismatch_cost"] == 0, "assigned reads cost zero")
+        check(sol["total_contaminant_penalty"] == 4, "penalty total")
+        check(sol["objective_mismatch_cost_plus_penalty"] == 4, "objective total")
+        check(sol["max_per_read_mismatches"] == 0, "assigned max mm zero")
+        check(len(sol["groups"]["haplotype"]) == 5, "five haplotype reads")
+        check(len(sol["groups"]["complement"]) == 5, "five complement reads")
+        junk = next(r for r in sol["per_read"] if r["id"] == "junk")
+        check(junk["group"] == 2, "junk label is 2")
+        check(junk["mismatch_count"] is None, "contaminant exempt from mismatch count")
+        check(junk["contaminant_penalty"] == 4, "per-read penalty echoed")
+        check(bool(junk["contaminant_reason"]), "contaminant reason present")
+        details = sol["contaminants"]
+        check(len(details) == 1, "one contaminant detail record")
+        check(details[0]["mismatches_vs_haplotype"] == 2, "mm vs haplotype evidence")
+        check(details[0]["mismatches_vs_complement"] == 3, "mm vs complement evidence")
+        check(details[0]["max_mismatches_allowance"] == 0, "allowance evidence")
+
+    def case_contaminant_capacity_short():
+        status, body = request("POST", "/api/phase", contaminant_capacity_short_sample())
+        check(status == 409, f"status {status}")
+        check(
+            body["error"]["code"] == "INSUFFICIENT_CONTAMINANT_CAPACITY",
+            f"body {body}",
+        )
+
+    def case_contaminant_evidence_short():
+        status, body = request("POST", "/api/phase", contaminant_evidence_short_sample())
+        check(status == 409, f"status {status}")
+        check(body["error"]["code"] == "INSUFFICIENT_GROUP_EVIDENCE", f"body {body}")
+
+    def case_contaminant_invalid():
+        # cap without per-read penalties
+        payload = contaminant_sample()
+        for row in payload["reads"]:
+            del row["contaminant_penalty"]
+        status, body = request("POST", "/api/phase", payload)
+        check(status == 422, f"status {status}")
+        check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
+        # cap out of range
+        payload = contaminant_sample()
+        payload["max_contaminant_reads"] = 5
+        status, body = request("POST", "/api/phase", payload)
+        check(status == 422, f"status {status}")
+        check(body["error"]["code"] == "INVALID_INPUT", f"body {body}")
+
     run("mismatch sample (unique, exact evidence)", case_mismatch)
     run("ambiguous sample (two tied solutions)", case_ambiguous)
+    run("contaminant sample (outlier isolated)", case_contaminant)
+    run("contaminant capacity shortage", case_contaminant_capacity_short)
+    run("contaminant group-evidence shortage", case_contaminant_evidence_short)
+    run("contaminant input validation", case_contaminant_invalid)
     run("no-solution business error", case_no_solution)
     run("discontinuous-coverage business error", case_discontinuous)
     run("invalid input rejected", case_invalid)
